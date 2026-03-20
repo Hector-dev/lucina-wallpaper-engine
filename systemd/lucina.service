@@ -1,0 +1,12 @@
+[Unit]
+Description=Lucina Engine - Adaptive Wayland Wallpaper
+After=graphical-session.target
+
+[Service]
+Type=forking
+ExecStart=%h/.local/bin/lucina --restore
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=graphical-session.target

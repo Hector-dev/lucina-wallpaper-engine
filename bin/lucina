@@ -1,0 +1,63 @@
+#!/bin/bash
+# Lucina Engine v2.8 - Wayland Wallpaper Manager
+
+# --- Configuración y Rutas XDG ---
+BASE_DIR="${LUCINA_WALLPAPER_DIR:-$HOME/wallpaper}"
+STATE_HOME="${XDG_STATE_HOME:-$HOME/.local/state}"
+CACHE_HOME="${XDG_CACHE_HOME:-$HOME/.cache}"
+
+STATE_FILE="$STATE_HOME/lucina_last_wallpaper"
+LOG_FILE="$CACHE_HOME/lucina_engine.log"
+
+mkdir -p "$(dirname "$STATE_FILE")" "$(dirname "$LOG_FILE")"
+
+log() { echo "[$(date "+%Y-%m-%d %H:%M:%S")] [$1] $2" >> "$LOG_FILE"; }
+
+# --- Validación de Dependencias ---
+check_dep() {
+    if ! command -v "$1" &> /dev/null; then
+        echo "Error: Dependencia '$1' no encontrada."
+        log "ERROR" "Dependencia '$1' no encontrada"
+        return 1
+    fi
+}
+
+for dep in mpvpaper mpv fzf grep awk find; do
+    check_dep "$dep" || exit 1
+done
+
+# --- Configuración de Sesión Wayland ---
+if [ -z "$WAYLAND_DISPLAY" ]; then
+    for x in wayland-1 wayland-0; do
+        [ -S "$XDG_RUNTIME_DIR/$x" ] && export WAYLAND_DISPLAY=$x && break
+    done
+fi
+
+# --- Detección de Monitor ---
+for i in {1..10}; do
+    MONITOR=$(mpvpaper -d | grep "Output:" | awk '{print $3}')
+    [ ! -z "$MONITOR" ] && break
+    sleep 2
+done
+
+[ -z "$MONITOR" ] && log "ERROR" "Monitor no detectado" && exit 1
+
+# --- Selección de Fondo ---
+if [[ "$1" == "--restore" ]]; then
+    [ -f "$STATE_FILE" ] && SELECTED=$(cat "$STATE_FILE") || exit 0
+else
+    SELECTED=$(find "$BASE_DIR" -maxdepth 2 -type f \( -name "*.mp4" -o -name "*.mkv" \) | sort | fzf --ansi --prompt="🌌 Selecciona tu fondo: ")
+fi
+
+[ -z "$SELECTED" ] && exit 0
+echo "$SELECTED" > "$STATE_FILE"
+
+# --- Ejecución ---
+# Limpieza suave de procesos previos
+pkill -SIGTERM mpvpaper 2>/dev/null
+pkill -SIGTERM mpv 2>/dev/null
+sleep 0.5
+
+export XDG_RUNTIME_DIR="/run/user/$(id -u)"
+log "INFO" "Iniciando renderizado en $MONITOR: $SELECTED"
+mpvpaper -f -p -o "--hwdec=nvdec --loop-file=inf --no-audio --vo=libmpv" "$MONITOR" "$SELECTED" >> "$LOG_FILE" 2>&1

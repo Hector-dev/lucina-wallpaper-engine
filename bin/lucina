@@ -27,8 +27,7 @@ declare -A PROFILES
 PROFILES[performance]="--vo=gpu --loop-file=inf --no-audio"
 PROFILES[mid]="--vo=gpu --profile=fast --loop-file=inf --no-audio"
 PROFILES[low]="--vo=gpu --profile=fast --vd-lavc-fast --framedrop=vo --loop-file=inf --no-audio"
-PROFILES[very_low]="--vo=gpu --gpu-context=wayland --hwdec-codecs=all --vd-lavc-fast --framedrop=vo --cache=no --demuxer-max-bytes=1MiB --vd-lavc-threads=1 --sws-scaler=fast --dither=no --scale=nearest --cscale=nearest --loop-file=inf --no-audio --gpu-api=opengl --video-sync=display-desync --alpha=no"
-
+PROFILES[very_low]="--vo=gpu --gpu-context=wayland --hwdec-codecs=all --vd-lavc-fast --framedrop=vo --cache=no --demuxer-max-bytes=1MiB --vd-lavc-threads=1 --sws-scaler=fast --dither=no --scale=nearest --cscale=nearest --loop-file=inf --no-audio --gpu-api=opengl --video-sync=display-desync --alpha=no --fast --hwdec-extra-frames=0 --gpu-dumb-mode=yes"
 # --- Funciones de Soporte ---
 log() { echo "[$(date "+%Y-%m-%d %H:%M:%S")] [$1] $2" >> "$LOG_FILE"; }
 

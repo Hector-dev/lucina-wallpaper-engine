@@ -1,63 +1,121 @@
 #!/bin/bash
-# Lucina Engine v2.8 - Wayland Wallpaper Manager
+# Lucina Engine v3.1 - Interactive Tech Lead Edition
+# Optimizaciones: 30% GPU (Very Low) | Transcoder | Menú Interactivo
 
-# --- Configuración y Rutas XDG ---
+# --- Configuración de Rutas ---
 BASE_DIR="${LUCINA_WALLPAPER_DIR:-$HOME/wallpaper}"
 STATE_HOME="${XDG_STATE_HOME:-$HOME/.local/state}"
 CACHE_HOME="${XDG_CACHE_HOME:-$HOME/.cache}"
-
 STATE_FILE="$STATE_HOME/lucina_last_wallpaper"
 LOG_FILE="$CACHE_HOME/lucina_engine.log"
 
 mkdir -p "$(dirname "$STATE_FILE")" "$(dirname "$LOG_FILE")"
 
+# --- Detección de Hardware ---
+detect_hwdec() {
+    if command -v nvidia-smi &> /dev/null; then echo "nvdec"
+    elif lspci | grep -qiE "intel|amd"; then echo "vaapi"
+    else echo "auto"; fi
+}
+HWDEC=$(detect_hwdec)
+
+# --- Perfiles de Rendimiento (Magia Negra Integrada) ---
+declare -A PROFILES
+PROFILES[performance]="--hwdec=$HWDEC --vo=gpu --loop-file=inf --no-audio"
+PROFILES[mid]="--hwdec=$HWDEC --vo=gpu --profile=fast --loop-file=inf --no-audio"
+PROFILES[low]="--hwdec=$HWDEC --vo=gpu --profile=fast --vd-lavc-fast --framedrop=vo --loop-file=inf --no-audio"
+# Cambia esta línea específicamente en tu script para la Canaima:
+PROFILES[very_low]="--hwdec=vaapi --vo=gpu --gpu-context=wayland --hwdec-codecs=all --vd-lavc-fast --framedrop=vo --cache=no --vd-lavc-threads=1 --sws-scaler=fast --dither=no --scale=nearest --cscale=nearest --loop-file=inf --no-audio --gpu-api=opengl --video-sync=display-desync"
+PROFILES[very_low]="--hwdec=vaapi --vo=gpu --gpu-context=wayland --hwdec-codecs=all --vd-lavc-fast --framedrop=vo --cache=no --demuxer-max-bytes=1MiB --vd-lavc-threads=1 --sws-scaler=fast --dither=no --scale=nearest --cscale=nearest --loop-file=inf --no-audio --gpu-api=opengl --tls-verify=no --alpha=no --video-sync=display-desync --interpolation=no --tscale=linear"
+#PROFILES[very_low]="--hwdec=auto-safe --vo=gpu --gpu-context=wayland --hwdec-codecs=all --vd-lavc-fast --framedrop=vo --cache=no --demuxer-max-bytes=1MiB --vd-lavc-threads=1 --sws-scaler=fast --dither=no --scale=nearest --cscale=nearest --loop-file=inf --no-audio --override-vrr=no --gpu-api=auto"
+#PROFILES[very_low]="--hwdec=$HWDEC --vo=gpu --gpu-context=wayland --gpu-dumb-mode=yes --vd-lavc-fast --framedrop=vo --cache=no --demuxer-max-bytes=1MiB --vd-lavc-threads=1 --sws-scaler=fast --dither=no --scale=nearest --cscale=nearest --loop-file=inf --no-audio"
+
+
+# --- Funciones de Soporte ---
 log() { echo "[$(date "+%Y-%m-%d %H:%M:%S")] [$1] $2" >> "$LOG_FILE"; }
 
-# --- Validación de Dependencias ---
-check_dep() {
-    if ! command -v "$1" &> /dev/null; then
-        echo "Error: Dependencia '$1' no encontrada."
-        log "ERROR" "Dependencia '$1' no encontrada"
-        return 1
-    fi
+show_help() {
+    clear
+    echo -e "\e[1;34m--- Lucina Engine v3.1 Help ---\e[0m"
+    echo -e "1. \e[1mModos de Energía:\e[0m"
+    echo -e "   - Very Low: El de 'Magia Negra' (30% GPU en Canaima 2x)."
+    echo -e "   - Low/Mid: Para laptops con mejor ventilación."
+    echo -e "   - Performance: Uso total de la RTX 3060."
+    echo -e "2. \e[1mOptimizar Video:\e[0m Transforma cualquier video a 12FPS y resolución nativa."
+    echo -e "3. \e[1mLogs:\e[0m Revisa $LOG_FILE si algo falla."
+    echo ""
+    read -p "Presiona Enter para volver al menú..."
 }
 
-for dep in mpvpaper mpv fzf grep awk find; do
-    check_dep "$dep" || exit 1
+transform_wallpaper() {
+    FILE=$(find "$BASE_DIR" -type f \( -name "*.mp4" -o -name "*.mkv" \) | fzf --prompt="Selecciona archivo para optimizar: ")
+    [ -z "$FILE" ] && return
+    
+    echo -e "\e[1;33mConfiguración de Transcodificación:\e[0m"
+    read -p "Resolución (Default 1366:768): " RES
+    RES=${RES:-1366:768}
+    read -p "FPS (Default 12): " FPS
+    FPS=${FPS:-12}
+    
+    OUTPUT="${FILE%.*}_opt_$(date +%s).mp4"
+    echo "🚀 Procesando... Esto liberará tu GPU para tus agentes de IA."
+    ffmpeg -i "$FILE" -vf "scale=$RES,fps=$FPS" -c:v libx264 -crf 26 -preset slow -an "$OUTPUT" -y
+    echo "✅ Optimización completada: $OUTPUT"
+    read -p "Presiona Enter para continuar..."
+}
+
+start_engine() {
+    # Limpieza de procesos previos
+    pkill -SIGTERM mpvpaper 2>/dev/null
+    sleep 0.3
+    
+    # Detección de Monitor
+    MONITOR=$(mpvpaper -d | grep "Output:" | awk '{print $3}' | head -n 1)
+    
+    log "INFO" "Iniciando: $1 en modo $2"
+    echo "🚀 Renderizando $1 en modo $2..."
+    mpvpaper -f -p -o "${PROFILES[$2]}" "$MONITOR" "$1" >> "$LOG_FILE" 2>&1
+}
+
+# --- Menú Principal (Workflow Interactivo) ---
+while true; do
+    clear
+    echo -e "\e[1;36mLucina Engine v3.1 | Hardware: $HWDEC | Monitor: $MONITOR\e[0m"
+    OPTION=$(echo -e "▶️ Iniciar Wallpaper (Full Setup)\n🔄 Restaurar Último\n🛠️  Optimizar Video (FFmpeg Tool)\n❓ Ayuda\n❌ Salir" | fzf --prompt="Selecciona una acción: ")
+
+    case "$OPTION" in
+        "▶️ Iniciar Wallpaper (Full Setup)")
+            SELECTED=$(find "$BASE_DIR" -maxdepth 2 -type f \( -name "*.mp4" -o -name "*.mkv" \) | sort | fzf --prompt="🌌 Elige tu fondo: ")
+            [ -z "$SELECTED" ] && continue
+            echo "$SELECTED" > "$STATE_FILE"
+            
+            MODE=$(echo "performance mid low very_low" | tr ' ' '\n' | fzf --prompt="⚡ Selecciona Perfil de Energía: ")
+            [ -z "$MODE" ] && continue
+            
+            start_engine "$SELECTED" "$MODE"
+            break
+            ;;
+        "🔄 Restaurar Último")
+            if [ -f "$STATE_FILE" ]; then
+                SELECTED=$(cat "$STATE_FILE")
+                start_engine "$SELECTED" "very_low"
+                break
+            else
+                echo "No hay sesión previa."
+                sleep 2
+            fi
+            ;;
+        "🛠️  Optimizar Video (FFmpeg Tool)")
+            transform_wallpaper
+            ;;
+        "❓ Ayuda")
+            show_help
+            ;;
+        "❌ Salir")
+            exit 0
+            ;;
+        *)
+            exit 0
+            ;;
+    esac
 done
-
-# --- Configuración de Sesión Wayland ---
-if [ -z "$WAYLAND_DISPLAY" ]; then
-    for x in wayland-1 wayland-0; do
-        [ -S "$XDG_RUNTIME_DIR/$x" ] && export WAYLAND_DISPLAY=$x && break
-    done
-fi
-
-# --- Detección de Monitor ---
-for i in {1..10}; do
-    MONITOR=$(mpvpaper -d | grep "Output:" | awk '{print $3}')
-    [ ! -z "$MONITOR" ] && break
-    sleep 2
-done
-
-[ -z "$MONITOR" ] && log "ERROR" "Monitor no detectado" && exit 1
-
-# --- Selección de Fondo ---
-if [[ "$1" == "--restore" ]]; then
-    [ -f "$STATE_FILE" ] && SELECTED=$(cat "$STATE_FILE") || exit 0
-else
-    SELECTED=$(find "$BASE_DIR" -maxdepth 2 -type f \( -name "*.mp4" -o -name "*.mkv" \) | sort | fzf --ansi --prompt="🌌 Selecciona tu fondo: ")
-fi
-
-[ -z "$SELECTED" ] && exit 0
-echo "$SELECTED" > "$STATE_FILE"
-
-# --- Ejecución ---
-# Limpieza suave de procesos previos
-pkill -SIGTERM mpvpaper 2>/dev/null
-pkill -SIGTERM mpv 2>/dev/null
-sleep 0.5
-
-export XDG_RUNTIME_DIR="/run/user/$(id -u)"
-log "INFO" "Iniciando renderizado en $MONITOR: $SELECTED"
-mpvpaper -f -p -o "--hwdec=nvdec --loop-file=inf --no-audio --vo=libmpv" "$MONITOR" "$SELECTED" >> "$LOG_FILE" 2>&1

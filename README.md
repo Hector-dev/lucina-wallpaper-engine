@@ -1,41 +1,60 @@
-# Lucina Engine v2.8 🌌
+# Lucina Engine v3.2 🌌
 
-Engine ligero para fondos animados en Wayland, optimizado para GPUs NVIDIA (arquitectura Ampere/RTX 3060+) mediante NVDEC/CUDA.
+**Lucina Engine** is a high-performance, universal wallpaper engine for Wayland. It transforms your desktop with dynamic videos and static images, featuring intelligent hardware acceleration and seamless persistence.
 
-## 🚀 Características
-- **Adaptive Session:** Detección automática de sesión Wayland (`wayland-0`/`wayland-1`).
-- **Hardware Acceleration:** Decodificación nativa por hardware para un consumo mínimo de CPU.
-- **Minimalista:** Escrito en Bash para mayor portabilidad y rapidez.
-- **Persistencia:** Integración nativa con Systemd para restaurar el fondo al iniciar sesión.
+---
 
-## 📋 Requisitos
-Asegúrate de tener instalados los siguientes paquetes:
-- `mpvpaper` (disponible en AUR o compílelo desde su fuente)
-- `mpv` (con soporte para `--hwdec=nvdec`)
-- `fzf` (para la selección interactiva de fondos)
-- `grep`, `awk`, `find` (utilidades estándar de Linux)
+## 🚀 Key Features
 
-## 🛠️ Instalación
+- **Universal Distro Support:** Native installers for **Arch Linux**, **Debian/Ubuntu/Pop!_OS**, and **Fedora**.
+- **Adaptive Rendering:** Supports both high-fidelity video formats (`.mp4`, `.mkv`) and static images (`.png`, `.jpg`, `.webp`, `.gif`).
+- **Intelligent Fallback:** Automatically detects GPU capabilities. If hardware acceleration (`nvdec`, `vaapi`) fails, it gracefully falls back to software rendering to ensure your wallpaper stays active.
+- **Hardware Optimized:** Pre-configured performance profiles (`performance`, `mid`, `low`, `very_low`) to balance visual quality and CPU/GPU usage.
+- **Session Persistence:** Built-in **Systemd user service** that automatically restores your last used wallpaper upon login.
+- **Dynamic Wayland Detection:** Seamlessly detects active Wayland sessions (`wayland-0`, `wayland-1`, etc.) and monitor resolutions.
+
+---
+
+## 📋 Requirements
+
+Lucina Engine automatically attempts to install these dependencies, but you can also install them manually:
+
+- `mpvpaper` (Core rendering engine)
+- `mpv` (Backend with HWDEC support)
+- `fzf` (Interactive selection menu)
+- `ffmpeg` (Video processing utilities)
+
+---
+
+## 🛠️ Installation
+
 ```bash
-git clone https://github.com/tu-usuario/lucina-engine.git
-cd lucina-engine
+git clone https://github.com/Hector-dev/lucina-wallpaper-engine.git
+cd lucina-wallpaper-engine
 chmod +x install.sh
 ./install.sh
 ```
 
-## 📖 Uso
-### Seleccionar un nuevo fondo:
-Simplemente ejecuta `lucina` en tu terminal. Se abrirá un menú interactivo con `fzf` listando los videos en tu carpeta de fondos (por defecto `~/wallpaper`).
+---
 
+## 📖 Usage
+
+### Launch the Interactive Menu
+Simply type `lucina` in your terminal to select a wallpaper, change performance profiles, or optimize your videos:
 ```bash
 lucina
 ```
 
-### Restaurar sesión:
-El motor restaura automáticamente el último fondo usado al iniciar la sesión gráfica gracias al servicio de Systemd incluido.
-
-## 📂 Configuración
-Por defecto, Lucina busca videos `.mp4` en `~/wallpaper`. Puedes cambiar esta ruta editando la variable `BASE_DIR` en el script o configurando las variables de entorno XDG correspondientes.
+### Automatic Restoration
+The engine includes a background daemon. Once you pick a wallpaper, it will survive terminal reloads and system reboots. To check the service status:
+```bash
+systemctl --user status lucina.service
+```
 
 ---
-Licencia MIT | 2026 Lucina Engine Contributors
+
+## 📂 Configuration
+By default, Lucina looks for files in `~/wallpaper`. You can customize this by setting the `LUCINA_WALLPAPER_DIR` environment variable in your `.zshrc` or `.bashrc`.
+
+---
+**MIT License | 2026 Lucina Engine Contributors**

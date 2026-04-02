@@ -7,10 +7,21 @@ BASE_DIR="${LUCINA_WALLPAPER_DIR:-$HOME/wallpaper}"
 STATE_HOME="${XDG_STATE_HOME:-$HOME/.local/state}"
 CACHE_HOME="${XDG_CACHE_HOME:-$HOME/.cache}"
 STATE_FILE="$STATE_HOME/lucina_last_wallpaper"
-CODEC_FILE="$STATE_HOME/lucina_codec_pref" # Nuevo: guarda tu preferencia
+CODEC_FILE="$STATE_HOME/lucina_codec_pref"
+PROFILE_FILE="$STATE_HOME/lucina_profile_pref"
 LOG_FILE="$CACHE_HOME/lucina_engine.log"
+LOCK_FILE="/tmp/lucina.lock"
 
-mkdir -p "$(dirname "$STATE_FILE")" "$(dirname "$LOG_FILE")"
+# --- Detección Dinámica de Wayland ---
+if [ -z "$WAYLAND_DISPLAY" ]; then
+    for i in {0..5}; do
+        if [ -S "$XDG_RUNTIME_DIR/wayland-$i" ]; then export WAYLAND_DISPLAY="wayland-$i"; break; fi
+    done
+fi
+
+# Asegurar directorios
+mkdir -p "$STATE_HOME" "$CACHE_HOME"
+touch "$LOG_FILE"
 
 # --- Gestión de Codecs ---
 # Si no existe preferencia, intenta detectar; si no, usa auto.
@@ -20,16 +31,40 @@ if [ ! -f "$CODEC_FILE" ]; then
     else echo "auto" > "$CODEC_FILE"; fi
 fi
 CURRENT_CODEC=$(cat "$CODEC_FILE")
+MONITOR=$(mpvpaper -d | grep "Output:" | awk '{print $3}' | head -n 1) # Inicializar monitor
 
 # --- Perfiles de Rendimiento ---
-# Eliminamos el flag --hwdec de aquí para inyectarlo dinámicamente
 declare -A PROFILES
 PROFILES[performance]="--vo=gpu --loop-file=inf --no-audio"
 PROFILES[mid]="--vo=gpu --profile=fast --loop-file=inf --no-audio"
 PROFILES[low]="--vo=gpu --profile=fast --vd-lavc-fast --framedrop=vo --loop-file=inf --no-audio"
 PROFILES[very_low]="--vo=gpu --gpu-context=wayland --hwdec-codecs=all --vd-lavc-fast --framedrop=vo --cache=no --demuxer-max-bytes=1MiB --vd-lavc-threads=1 --sws-scaler=fast --dither=no --scale=nearest --cscale=nearest --loop-file=inf --no-audio --gpu-api=opengl --video-sync=display-desync --alpha=no --fast --hwdec-extra-frames=0 --gpu-dumb-mode=yes"
+
 # --- Funciones de Soporte ---
 log() { echo "[$(date "+%Y-%m-%d %H:%M:%S")] [$1] $2" >> "$LOG_FILE"; }
+
+get_resolution() {
+    local res=""
+    if command -v hyprctl &>/dev/null; then
+        res=$(hyprctl monitors | grep -oP '\d+x\d+@[\d.]+' | head -n 1)
+    elif command -v swaymsg &>/dev/null; then
+        res=$(swaymsg -t get_outputs | jq -r '.[0].current_mode | "\(.width)x\(.height)"')
+    else
+        res=$(cat /sys/class/drm/*/modes 2>/dev/null | head -n 1)
+    fi
+    echo "${res:-Unknown}"
+}
+
+check_instance() {
+    if [ -f "$LOCK_FILE" ]; then
+        pid=$(cat "$LOCK_FILE")
+        if ps -p "$pid" > /dev/null 2>&1; then
+            log "WARN" "Instancia ya activa (PID: $pid). Saliendo."
+            exit 1
+        fi
+    fi
+    echo $$ > "$LOCK_FILE"
+}
 
 change_codec() {
     clear
@@ -51,24 +86,71 @@ start_engine() {
     sleep 0.3
     
     MONITOR=$(mpvpaper -d | grep "Output:" | awk '{print $3}' | head -n 1)
+    RESOLUTION=$(get_resolution)
     
     # Inyección del codec seleccionado + perfil
     HW_FLAG="--hwdec=$CURRENT_CODEC"
     
-    log "INFO" "Iniciando: $1 | Modo: $2 | Codec: $CURRENT_CODEC"
-    echo "🚀 Renderizando con $CURRENT_CODEC en modo $2..."
-    mpvpaper -f -p -o "$HW_FLAG ${PROFILES[$2]}" "$MONITOR" "$1" >> "$LOG_FILE" 2>&1
+    log "INFO" "Iniciando: $1 | Modo: $2 | Codec: $CURRENT_CODEC | Res: $RESOLUTION"
+    echo "🚀 Renderizando en $MONITOR ($RESOLUTION) con $CURRENT_CODEC en modo $2..."
+    
+    # Guardar estado para persistencia
+    echo "$1" > "$STATE_FILE"
+    echo "$2" > "$PROFILE_FILE"
+    get_resolution
+    
+    # Limpieza previa agresiva
+    pkill -9 -f mpvpaper 2>/dev/null
+    sleep 0.2
+
+    # Si es una imagen o GIF, desactivar HWDEC (evita fallos en NVIDIA)
+    case "${1##*.}" in
+        png|jpg|jpeg|webp|gif)
+            HW_FLAG="--hwdec=no"
+            log "INFO" "Formato estático detectado, usando software."
+            ;;
+    esac
+
+    # Flags universales
+    LOOP_FLAGS="--loop-file=inf --loop-playlist=inf --no-audio"
+    
+    log "INFO" "Iniciando: $1 | Modo: $2 | Codec: $CURRENT_CODEC | Res: $RESOLUTION"
+    echo "🚀 Renderizando en $MONITOR ($RESOLUTION) con $CURRENT_CODEC en modo $2..."
+
+    # Intentar con la configuración preferida. 
+    if ! mpvpaper -f -p -o "$HW_FLAG $LOOP_FLAGS ${PROFILES[$2]}" "$MONITOR" "$1" >> "$LOG_FILE" 2>&1; then
+        log "ERROR" "Fallo inicial. Reintentando con Fallback de Software mediante EXEC..."
+        exec mpvpaper -f -p -o "--hwdec=no $LOOP_FLAGS ${PROFILES[low]}" "$MONITOR" "$1" >> "$LOG_FILE" 2>&1
+    fi
 }
+
+# --- Manejo de Argumentos ---
+if [[ "$1" == "--restore" ]]; then
+    if [ -f "$STATE_FILE" ]; then
+        LAST_WALL=$(cat "$STATE_FILE")
+        LAST_PROF=$(cat "$PROFILE_FILE" 2>/dev/null || echo "performance")
+        log "INFO" "Restaurando sesión: $LAST_WALL ($LAST_PROF)"
+        start_engine "$LAST_WALL" "$LAST_PROF"
+        exit 0
+    else
+        log "WARN" "No hay sesión para restaurar. El servicio se mantendrá inactivo."
+        # Mantener el proceso vivo para que systemd no lo reinicie en bucle
+        tail -f /dev/null
+    fi
+fi
+
+check_instance
 
 # --- Menú Principal ---
 while true; do
     clear
     echo -e "\e[1;36mLucina Engine v3.2 | Codec: $CURRENT_CODEC | Monitor: $MONITOR\e[0m"
+    echo -e "\e[0;33mLogs en: $LOG_FILE\e[0m"
     OPTION=$(echo -e "▶️ Iniciar Wallpaper\n🔄 Restaurar Último\n⚙️  Cambiar Codec (HWDEC)\n🛠️  Optimizar Video\n❌ Salir" | fzf --prompt="Selecciona una acción: ")
 
     case "$OPTION" in
         "▶️ Iniciar Wallpaper")
-            SELECTED=$(find "$BASE_DIR" -maxdepth 2 -type f \( -name "*.mp4" -o -name "*.mkv" \) | sort | fzf --prompt="🌌 Fondo: ")
+            SELECTED=$(find "$BASE_DIR" -maxdepth 2 -type f \( -name "*.mp4" -o -name "*.mkv" -o -name "*.png" -o -name "*.jpg" -o -name "*.jpeg" -o -name "*.webp" -o -name "*.gif" \) | sort | fzf --prompt="🌌 Fondo: ")
             [ -z "$SELECTED" ] && continue
             echo "$SELECTED" > "$STATE_FILE"
             
@@ -80,7 +162,9 @@ while true; do
             ;;
         "🔄 Restaurar Último")
             if [ -f "$STATE_FILE" ]; then
-                start_engine "$(cat "$STATE_FILE")" "very_low"
+                LAST_WALL=$(cat "$STATE_FILE")
+                LAST_PROF=$(cat "$PROFILE_FILE" 2>/dev/null || echo "very_low")
+                start_engine "$LAST_WALL" "$LAST_PROF"
                 break
             else
                 echo "No hay sesión previa."; sleep 2

@@ -1,12 +1,15 @@
 [Unit]
 Description=Lucina Engine - Adaptive Wayland Wallpaper
 After=graphical-session.target
+PartOf=graphical-session.target
 
 [Service]
-Type=forking
+Type=simple
 ExecStart=%h/.local/bin/lucina --restore
-Restart=on-failure
-RestartSec=10
+Restart=always
+RestartSec=5
+# Heredar variables de la sesión gráfica si es posible
+Environment=XDG_RUNTIME_DIR=/run/user/%U
 
 [Install]
 WantedBy=graphical-session.target

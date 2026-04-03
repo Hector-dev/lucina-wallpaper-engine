@@ -1,6 +1,6 @@
 #!/bin/bash
-# Lucina Engine v3.2 - Codec Adaptive Edition
-# Optimizaciones: Selección manual de HWDEC | Persistencia de Configuración
+# Lucina Engine v3.2.1 - Systemd Optimized Edition
+# Tech Lead Note: Implementación de 'exec' para persistencia de PID y control de señales.
 
 # --- Configuración de Rutas ---
 BASE_DIR="${LUCINA_WALLPAPER_DIR:-$HOME/wallpaper}"
@@ -12,10 +12,13 @@ PROFILE_FILE="$STATE_HOME/lucina_profile_pref"
 LOG_FILE="$CACHE_HOME/lucina_engine.log"
 LOCK_FILE="/tmp/lucina.lock"
 
-# --- Detección Dinámica de Wayland ---
+# --- Detección Dinámica de Wayland (Crucial para Systemd) ---
 if [ -z "$WAYLAND_DISPLAY" ]; then
     for i in {0..5}; do
-        if [ -S "$XDG_RUNTIME_DIR/wayland-$i" ]; then export WAYLAND_DISPLAY="wayland-$i"; break; fi
+        if [ -S "$XDG_RUNTIME_DIR/wayland-$i" ]; then 
+            export WAYLAND_DISPLAY="wayland-$i"
+            break
+        fi
     done
 fi
 
@@ -24,14 +27,12 @@ mkdir -p "$STATE_HOME" "$CACHE_HOME"
 touch "$LOG_FILE"
 
 # --- Gestión de Codecs ---
-# Si no existe preferencia, intenta detectar; si no, usa auto.
 if [ ! -f "$CODEC_FILE" ]; then
     if command -v nvidia-smi &> /dev/null; then echo "nvdec" > "$CODEC_FILE"
     elif lspci | grep -qiE "intel|amd"; then echo "vaapi" > "$CODEC_FILE"
     else echo "auto" > "$CODEC_FILE"; fi
 fi
 CURRENT_CODEC=$(cat "$CODEC_FILE")
-MONITOR=$(mpvpaper -d | grep "Output:" | awk '{print $3}' | head -n 1) # Inicializar monitor
 
 # --- Perfiles de Rendimiento ---
 declare -A PROFILES
@@ -55,128 +56,71 @@ get_resolution() {
     echo "${res:-Unknown}"
 }
 
-check_instance() {
-    if [ -f "$LOCK_FILE" ]; then
-        pid=$(cat "$LOCK_FILE")
-        if ps -p "$pid" > /dev/null 2>&1; then
-            log "WARN" "Instancia ya activa (PID: $pid). Saliendo."
-            exit 1
-        fi
-    fi
-    echo $$ > "$LOCK_FILE"
-}
-
-change_codec() {
-    clear
-    echo -e "\e[1;35m--- Configuración de Aceleración de Hardware ---\e[0m"
-    echo "Codec actual: $CURRENT_CODEC"
-    echo ""
-    NEW_CODEC=$(echo -e "vaapi (Recomendado Canaima/Intel)\nnvdec (Recomendado NVIDIA/RTX)\nauto (Detección automática)\nsoftware (Carga total a CPU)" | fzf --prompt="Selecciona Codec: " | awk '{print $1}')
-    
-    if [ ! -z "$NEW_CODEC" ]; then
-        echo "$NEW_CODEC" > "$CODEC_FILE"
-        CURRENT_CODEC=$NEW_CODEC
-        echo "✅ Preferencia actualizada a: $CURRENT_CODEC"
-        sleep 1
-    fi
-}
-
 start_engine() {
-    pkill -SIGTERM mpvpaper 2>/dev/null
-    sleep 0.3
+    # Limpieza de cualquier instancia previa para evitar el "ghosting"
+    pkill -9 -f mpvpaper 2>/dev/null
+    sleep 0.2
     
     MONITOR=$(mpvpaper -d | grep "Output:" | awk '{print $3}' | head -n 1)
     RESOLUTION=$(get_resolution)
-    
-    # Inyección del codec seleccionado + perfil
     HW_FLAG="--hwdec=$CURRENT_CODEC"
     
-    log "INFO" "Iniciando: $1 | Modo: $2 | Codec: $CURRENT_CODEC | Res: $RESOLUTION"
-    echo "🚀 Renderizando en $MONITOR ($RESOLUTION) con $CURRENT_CODEC en modo $2..."
-    
-    # Guardar estado para persistencia
-    echo "$1" > "$STATE_FILE"
-    echo "$2" > "$PROFILE_FILE"
-    get_resolution
-    
-    # Limpieza previa agresiva
-    pkill -9 -f mpvpaper 2>/dev/null
-    sleep 0.2
-
-    # Si es una imagen o GIF, desactivar HWDEC (evita fallos en NVIDIA)
+    # Manejo de formatos estáticos
     case "${1##*.}" in
-        png|jpg|jpeg|webp|gif)
-            HW_FLAG="--hwdec=no"
-            log "INFO" "Formato estático detectado, usando software."
-            ;;
+        png|jpg|jpeg|webp|gif) HW_FLAG="--hwdec=no" ;;
     esac
 
-    # Flags universales
     LOOP_FLAGS="--loop-file=inf --loop-playlist=inf --no-audio"
     
-    log "INFO" "Iniciando: $1 | Modo: $2 | Codec: $CURRENT_CODEC | Res: $RESOLUTION"
-    echo "🚀 Renderizando en $MONITOR ($RESOLUTION) con $CURRENT_CODEC en modo $2..."
+    log "INFO" "Renderizando en $MONITOR ($RESOLUTION) con $CURRENT_CODEC en modo $2"
+    
+    # Persistencia
+    echo "$1" > "$STATE_FILE"
+    echo "$2" > "$PROFILE_FILE"
 
-    # Intentar con la configuración preferida. 
-    if ! mpvpaper -f -p -o "$HW_FLAG $LOOP_FLAGS ${PROFILES[$2]}" "$MONITOR" "$1" >> "$LOG_FILE" 2>&1; then
-        log "ERROR" "Fallo inicial. Reintentando con Fallback de Software mediante EXEC..."
-        exec mpvpaper -f -p -o "--hwdec=no $LOOP_FLAGS ${PROFILES[low]}" "$MONITOR" "$1" >> "$LOG_FILE" 2>&1
-    fi
+    # El EXEC es la clave: el script desaparece y el PID de mpvpaper toma su lugar
+    # Esto permite que systemd controle el proceso de forma nativa.
+    exec mpvpaper -f -p -o "$HW_FLAG $LOOP_FLAGS ${PROFILES[$2]}" "$MONITOR" "$1" >> "$LOG_FILE" 2>&1
 }
 
 # --- Manejo de Argumentos ---
 if [[ "$1" == "--restore" ]]; then
     if [ -f "$STATE_FILE" ]; then
         LAST_WALL=$(cat "$STATE_FILE")
-        LAST_PROF=$(cat "$PROFILE_FILE" 2>/dev/null || echo "performance")
-        log "INFO" "Restaurando sesión: $LAST_WALL ($LAST_PROF)"
+        LAST_PROF=$(cat "$PROFILE_FILE" 2>/dev/null || echo "very_low")
         start_engine "$LAST_WALL" "$LAST_PROF"
-        exit 0
     else
-        log "WARN" "No hay sesión para restaurar. El servicio se mantendrá inactivo."
-        # Mantener el proceso vivo para que systemd no lo reinicie en bucle
-        tail -f /dev/null
+        log "WARN" "Nada que restaurar."
+        exit 0
     fi
 fi
 
-check_instance
+# --- Menú Principal (Interactivo) ---
+# (Nota: check_instance solo se llama si no es --restore)
+[ -f "$LOCK_FILE" ] && pid=$(cat "$LOCK_FILE") && ps -p "$pid" > /dev/null 2>&1 && exit 1
+echo $$ > "$LOCK_FILE"
 
-# --- Menú Principal ---
 while true; do
     clear
-    echo -e "\e[1;36mLucina Engine v3.2 | Codec: $CURRENT_CODEC | Monitor: $MONITOR\e[0m"
-    echo -e "\e[0;33mLogs en: $LOG_FILE\e[0m"
-    OPTION=$(echo -e "▶️ Iniciar Wallpaper\n🔄 Restaurar Último\n⚙️  Cambiar Codec (HWDEC)\n🛠️  Optimizar Video\n❌ Salir" | fzf --prompt="Selecciona una acción: ")
+    MONITOR=$(mpvpaper -d | grep "Output:" | awk '{print $3}' | head -n 1)
+    echo -e "\e[1;36mLucina Engine v3.2.1 | Codec: $CURRENT_CODEC | Monitor: $MONITOR\e[0m"
+    OPTION=$(echo -e "▶️ Iniciar Wallpaper\n🔄 Restaurar Último\n⚙️  Cambiar Codec\n❌ Salir" | fzf --prompt="Acción: ")
 
     case "$OPTION" in
         "▶️ Iniciar Wallpaper")
-            SELECTED=$(find "$BASE_DIR" -maxdepth 2 -type f \( -name "*.mp4" -o -name "*.mkv" -o -name "*.png" -o -name "*.jpg" -o -name "*.jpeg" -o -name "*.webp" -o -name "*.gif" \) | sort | fzf --prompt="🌌 Fondo: ")
+            SELECTED=$(find "$BASE_DIR" -maxdepth 2 -type f \( -name "*.mp4" -o -name "*.mkv" -o -name "*.png" -o -name "*.jpg" -o -name "*.jpeg" -o -name "*.webp" -o -name "*.gif" \) | sort | fzf --prompt="Fondo: ")
             [ -z "$SELECTED" ] && continue
-            echo "$SELECTED" > "$STATE_FILE"
-            
-            MODE=$(echo "performance mid low very_low" | tr ' ' '\n' | fzf --prompt="⚡ Perfil: ")
+            MODE=$(echo "performance mid low very_low" | tr ' ' '\n' | fzf --prompt="Perfil: ")
             [ -z "$MODE" ] && continue
-            
             start_engine "$SELECTED" "$MODE"
-            break
             ;;
         "🔄 Restaurar Último")
-            if [ -f "$STATE_FILE" ]; then
-                LAST_WALL=$(cat "$STATE_FILE")
-                LAST_PROF=$(cat "$PROFILE_FILE" 2>/dev/null || echo "very_low")
-                start_engine "$LAST_WALL" "$LAST_PROF"
-                break
-            else
-                echo "No hay sesión previa."; sleep 2
-            fi
+            [ -f "$STATE_FILE" ] && start_engine "$(cat "$STATE_FILE")" "$(cat "$PROFILE_FILE" 2>/dev/null || echo "very_low")"
             ;;
-        "⚙️  Cambiar Codec (HWDEC)")
-            change_codec
+        "⚙️  Cambiar Codec")
+            NEW_CODEC=$(echo -e "vaapi\nnvdec\nauto\nsoftware" | fzf --prompt="Codec: ")
+            [ ! -z "$NEW_CODEC" ] && echo "$NEW_CODEC" > "$CODEC_FILE" && CURRENT_CODEC=$NEW_CODEC
             ;;
-        "🛠️  Optimizar Video")
-            # Tu función transform_wallpaper original aquí...
-            ;;
-        "❌ Salir") exit 0 ;;
         *) exit 0 ;;
     esac
 done

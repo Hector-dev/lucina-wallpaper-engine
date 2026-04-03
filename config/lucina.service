@@ -1,0 +1,17 @@
+[Unit]
+Description=Lucina Engine - Adaptive Wayland Wallpaper
+After=graphical-session.target
+
+[Service]
+# Cambiamos a 'oneshot' para que systemd entienda que el script lanza y sale
+Type=oneshot
+ExecStart=/home/hector/.local/bin/lucina --restore
+# IMPORTANTE: Esto le dice a systemd que no mate a mpvpaper cuando el script salga
+RemainAfterExit=yes
+# Ya no necesitamos reinicios automáticos agresivos
+Restart=no
+Environment=XDG_RUNTIME_DIR=/run/user/1000
+Environment=WAYLAND_DISPLAY=wayland-1
+
+[Install]
+WantedBy=graphical-session.target

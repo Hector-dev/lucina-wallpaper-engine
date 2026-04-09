@@ -5,7 +5,7 @@ PartOf=graphical-session.target
 
 [Service]
 Type=simple
-ExecStart=%h/.local/bin/lucina --restore
+ExecStart=%h/.local/bin/lucina --restore --no-fork
 Restart=always
 RestartSec=5
 # Heredar variables de la sesión gráfica si es posible

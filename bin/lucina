@@ -11,6 +11,24 @@ CODEC_FILE="$STATE_HOME/lucina_codec_pref"
 PROFILE_FILE="$STATE_HOME/lucina_profile_pref"
 LOG_FILE="$CACHE_HOME/lucina_engine.log"
 LOCK_FILE="/tmp/lucina.lock"
+WIDGET_DIR="$HOME/.local/share/lucina/widgets"
+WIDGETS_CONF="$STATE_HOME/lucina_widgets.conf"
+USE_FORK="true"
+
+# Inicializar config de widgets si no existe
+if [ ! -f "$WIDGETS_CONF" ]; then
+    mkdir -p "$(dirname "$WIDGETS_CONF")"
+    cat <<EOF > "$WIDGETS_CONF"
+clock_enabled=true
+clock_color=FFFFFF
+clock_size=64
+clock_pos_x=50
+clock_pos_y=50
+clock_format=%H:%M:%S
+clock_font=sans-serif
+EOF
+fi
+
 
 # --- Detección Dinámica de Wayland ---
 if [ -z "$WAYLAND_DISPLAY" ]; then
@@ -19,8 +37,11 @@ if [ -z "$WAYLAND_DISPLAY" ]; then
     done
 fi
 
-# Asegurar directorios
+# Asegurar directorios y limpiar logs si crecen mucho
 mkdir -p "$STATE_HOME" "$CACHE_HOME"
+if [ -f "$LOG_FILE" ] && [ $(stat -c%s "$LOG_FILE" 2>/dev/null || echo 0) -gt 1048576 ]; then
+    tail -n 100 "$LOG_FILE" > "$LOG_FILE.tmp" && mv "$LOG_FILE.tmp" "$LOG_FILE"
+fi
 touch "$LOG_FILE"
 
 # --- Gestión de Codecs ---
@@ -35,13 +56,73 @@ MONITOR=$(mpvpaper -d | grep "Output:" | awk '{print $3}' | head -n 1) # Inicial
 
 # --- Perfiles de Rendimiento ---
 declare -A PROFILES
-PROFILES[performance]="--vo=gpu --loop-file=inf --no-audio"
-PROFILES[mid]="--vo=gpu --profile=fast --loop-file=inf --no-audio"
-PROFILES[low]="--vo=gpu --profile=fast --vd-lavc-fast --framedrop=vo --loop-file=inf --no-audio"
-PROFILES[very_low]="--vo=gpu --gpu-context=wayland --hwdec-codecs=all --vd-lavc-fast --framedrop=vo --cache=no --demuxer-max-bytes=1MiB --vd-lavc-threads=1 --sws-scaler=fast --dither=no --scale=nearest --cscale=nearest --loop-file=inf --no-audio --gpu-api=opengl --video-sync=display-desync --alpha=no --fast --hwdec-extra-frames=0 --gpu-dumb-mode=yes"
+PROFILES[performance]="--loop-file=inf"
+PROFILES[mid]="--profile=fast --loop-file=inf"
+PROFILES[low]="--profile=fast --vd-lavc-fast --framedrop=vo --loop-file=inf"
+PROFILES[very_low]="--gpu-context=wayland --hwdec-codecs=all --vd-lavc-fast --framedrop=vo --cache=no --demuxer-max-bytes=1MiB --vd-lavc-threads=1 --sws-scaler=fast --dither=no --scale=nearest --cscale=nearest --gpu-api=opengl --video-sync=display-desync --alpha=no --fast --hwdec-extra-frames=0 --gpu-dumb-mode=yes"
 
 # --- Funciones de Soporte ---
 log() { echo "[$(date "+%Y-%m-%d %H:%M:%S")] [$1] $2" >> "$LOG_FILE"; }
+
+stop_cava() {
+    [ -f "$STATE_HOME/cava.pid" ] && kill $(cat "$STATE_HOME/cava.pid") 2>/dev/null
+    [ -f "$STATE_HOME/bridge.pid" ] && kill $(cat "$STATE_HOME/bridge.pid") 2>/dev/null
+    rm -f "$STATE_HOME/cava.pid" "$STATE_HOME/bridge.pid" /tmp/lucina_cava.fifo /tmp/lucina_mpv.sock
+}
+
+start_cava() {
+    log "DEBUG" "Entrando a start_cava..."
+    local VIZ_VAL=$(get_widget_val "visualizer_enabled")
+    log "DEBUG" "Valor visualizer_enabled: '$VIZ_VAL'"
+    stop_cava
+    if [ "$VIZ_VAL" = "true" ]; then
+        log "DEBUG" "Configurando FIFO y CAVA..."
+        mkfifo /tmp/lucina_cava.fifo
+        # Crear config temporal forzada al puerto correcto
+        local MONITOR_AV=$(pactl list short sources 2>/dev/null | grep ".monitor" | head -n 1 | awk '{print $2}')
+        cat <<EOF > /tmp/lucina_cava_config
+[general]
+bars = $(get_widget_val "viz_num_bars" || echo 40)
+[input]
+method = pulse
+source = ${MONITOR_AV:-auto}
+[output]
+method = raw
+data_format = ascii
+ascii_max_range = 100
+EOF
+        cava -p /tmp/lucina_cava_config > /tmp/lucina_cava.fifo 2>> "$LOG_FILE" &
+        echo $! > "$STATE_HOME/cava.pid"
+        
+        # Puente Pasivo v4 (Archivo en memoria): Cero Carga IPC
+        python3 -c '
+import time, os
+def bridge():
+    while True:
+        try:
+            with open("/tmp/lucina_cava.fifo", "r") as f_in:
+                while True:
+                    line = f_in.readline()
+                    if not line: break
+                    # Escribir solo la ultima linea en un archivo temporal (atómico)
+                    with open("/tmp/lucina_cava.data.tmp", "w") as f_out:
+                        f_out.write(line.strip())
+                    os.rename("/tmp/lucina_cava.data.tmp", "/tmp/lucina_cava.data")
+                    time.sleep(0.05) # 20 FPS
+        except:
+            time.sleep(1)
+bridge()' >> "$LOG_FILE" 2>&1 &
+        echo $! > "$STATE_HOME/bridge.pid"
+        log "INFO" "Instancia de CAVA y Puente iniciados."
+    fi
+}
+set_widget_val() { sed -i "/^$1=/d" "$WIDGETS_CONF"; echo "$1=$2" >> "$WIDGETS_CONF"; }
+get_widget_val() { grep "^$1=" "$WIDGETS_CONF" | cut -d= -f2; }
+check_instance() {
+    if pgrep -x "mpvpaper" > /dev/null && [ "$USE_FORK" = "true" ]; then
+        echo "⚠️  Lucina ya está corriendo. Usa el menú para gestionarla."
+    fi
+}
 
 get_resolution() {
     local res=""
@@ -91,16 +172,13 @@ start_engine() {
     # Inyección del codec seleccionado + perfil
     HW_FLAG="--hwdec=$CURRENT_CODEC"
     
-    log "INFO" "Iniciando: $1 | Modo: $2 | Codec: $CURRENT_CODEC | Res: $RESOLUTION"
-    echo "🚀 Renderizando en $MONITOR ($RESOLUTION) con $CURRENT_CODEC en modo $2..."
-    
     # Guardar estado para persistencia
     echo "$1" > "$STATE_FILE"
     echo "$2" > "$PROFILE_FILE"
-    get_resolution
     
     # Limpieza previa agresiva
     pkill -9 -f mpvpaper 2>/dev/null
+    stop_cava # Detener visualizador previo
     sleep 0.2
 
     # Si es una imagen o GIF, desactivar HWDEC (evita fallos en NVIDIA)
@@ -111,21 +189,43 @@ start_engine() {
             ;;
     esac
 
-    # Flags universales
-    LOOP_FLAGS="--loop-file=inf --loop-playlist=inf --no-audio"
+    # Flags universales para minimizar consumo de RAM y CPU
+    LOOP_FLAGS="--loop-file=inf --loop-playlist=inf --no-audio --cache=no --demuxer-max-bytes=16MiB --demuxer-max-back-bytes=16MiB --msg-level=all=no --terminal=no --input-ipc-server=/tmp/lucina_mpv.sock"
     
-    log "INFO" "Iniciando: $1 | Modo: $2 | Codec: $CURRENT_CODEC | Res: $RESOLUTION"
+    # Inyectar Script de Widgets si existe
+    if [ -f "$WIDGET_DIR/lucina_widgets.lua" ]; then
+        LOOP_FLAGS="$LOOP_FLAGS --script=$WIDGET_DIR/lucina_widgets.lua"
+    fi
+
+    # Iniciar motor CAVA real si está habilitado
+    start_cava
+
+    log "INFO" "Iniciando: $1 | Modo: $2 | Codec: $CURRENT_CODEC | Res: $RESOLUTION | Monitor: $MONITOR | Fork: $USE_FORK"
+    log "DEBUG" "Banderas mpv: $HW_FLAG $LOOP_FLAGS ${PROFILES[$2]}"
     echo "🚀 Renderizando en $MONITOR ($RESOLUTION) con $CURRENT_CODEC en modo $2..."
 
-    # Intentar con la configuración preferida. 
-    if ! mpvpaper -f -p -o "$HW_FLAG $LOOP_FLAGS ${PROFILES[$2]}" "$MONITOR" "$1" >> "$LOG_FILE" 2>&1; then
-        log "ERROR" "Fallo inicial. Reintentando con Fallback de Software mediante EXEC..."
-        exec mpvpaper -f -p -o "--hwdec=no $LOOP_FLAGS ${PROFILES[low]}" "$MONITOR" "$1" >> "$LOG_FILE" 2>&1
+    if [ "$USE_FORK" = "false" ]; then
+        # Modo Foreground (Ideal para systemd)
+        if ! mpvpaper -p -o "$HW_FLAG $LOOP_FLAGS ${PROFILES[$2]}" "$MONITOR" "$1" >> "$LOG_FILE" 2>&1; then
+            log "ERROR" "Fallo inicial. Reintentando con Fallback de Software..."
+            exec mpvpaper -p -o "--hwdec=no $LOOP_FLAGS ${PROFILES[low]}" "$MONITOR" "$1" >> "$LOG_FILE" 2>&1
+        fi
+    else
+        # Modo Background (Ideal para terminal interactiva)
+        if ! mpvpaper -f -p -o "$HW_FLAG $LOOP_FLAGS ${PROFILES[$2]}" "$MONITOR" "$1" >> "$LOG_FILE" 2>&1; then
+            log "ERROR" "Fallo inicial. Reintentando con Fallback de Software mediante EXEC..."
+            exec mpvpaper -f -p -o "--hwdec=no $LOOP_FLAGS ${PROFILES[low]}" "$MONITOR" "$1" >> "$LOG_FILE" 2>&1
+        fi
     fi
 }
 
 # --- Manejo de Argumentos ---
+if [[ "$*" == *"--no-fork"* ]]; then
+    USE_FORK="false"
+fi
+
 if [[ "$1" == "--restore" ]]; then
+    USE_FORK="false" # El servicio de systemd requiere primer plano
     if [ -f "$STATE_FILE" ]; then
         LAST_WALL=$(cat "$STATE_FILE")
         LAST_PROF=$(cat "$PROFILE_FILE" 2>/dev/null || echo "performance")
@@ -139,26 +239,212 @@ if [[ "$1" == "--restore" ]]; then
     fi
 fi
 
-check_instance
+
+widgets_menu() {
+    while true; do
+        clear
+        echo -e "\e[1;35m--- Lucina Widgets Manager ---\e[0m"
+        local CLOCK_EN=$(get_widget_val "clock_enabled")
+        local SYS_EN=$(get_widget_val "sys_enabled")
+        local CPU_EN=$(get_widget_val "cpu_enabled")
+        local NET_EN=$(get_widget_val "net_enabled")
+        local MEDIA_EN=$(get_widget_val "media_enabled")
+        local BAT_EN=$(get_widget_val "bat_enabled")
+        local VIZ_EN=$(get_widget_val "visualizer_enabled")
+        
+        local VIZ_EN=$(get_widget_val "visualizer_enabled")
+        [ -z "$VIZ_EN" ] && VIZ_EN="false"
+
+        OPTION=$(echo -e "🔔 Reloj: [$CLOCK_EN]\n🔔 RAM/CPU/BAT: [$SYS_EN]\n🔔 Visualizador (CAVA): [$VIZ_EN]\n\n📍 Ajustar Posición y Tamaño\n✨ Personalizar Visualizador CAVA\n🎨 Estilo Reloj\n↩️ Volver" | fzf --prompt="Selecciona una opción: ")
+
+        [ -z "$OPTION" ] && return
+
+        case "$OPTION" in
+            "🔔 Reloj:"*) [ "$CLOCK_EN" = "true" ] && set_widget_val "clock_enabled" "false" || set_widget_val "clock_enabled" "true" ;;
+            "🔔 RAM:"*) [ "$SYS_EN" = "true" ] && set_widget_val "sys_enabled" "false" || set_widget_val "sys_enabled" "true" ;;
+            "🔔 CPU:"*) [ "$CPU_EN" = "true" ] && set_widget_val "cpu_enabled" "false" || set_widget_val "cpu_enabled" "true" ;;
+            "🔔 Red:"*) [ "$NET_EN" = "true" ] && set_widget_val "net_enabled" "false" || set_widget_val "net_enabled" "true" ;;
+            "🔔 Media:"*) [ "$MEDIA_EN" = "true" ] && set_widget_val "media_enabled" "false" || set_widget_val "media_enabled" "true" ;;
+            "🔔 Batería:"*) [ "$BAT_EN" = "true" ] && set_widget_val "bat_enabled" "false" || set_widget_val "bat_enabled" "true" ;;
+            "🔔 Visualizador"*) 
+                [ "$VIZ_EN" = "true" ] && set_widget_val "visualizer_enabled" "false" || set_widget_val "visualizer_enabled" "true"
+                # Reiniciar motor para aplicar filtro (solo si hay wallpaper activo)
+                if [ -f "$STATE_FILE" ]; then
+                    start_engine "$(cat "$STATE_FILE")" "$(cat "$PROFILE_FILE" 2>/dev/null || echo "performance")" & 
+                fi
+                ;;
+            
+            "📍 Ajustar Posición"*)
+                TARGET=$(echo -e "Reloj\nRAM\nCPU\nRed\nMedia\nBatería" | fzf --prompt="Ajustar posición de: ")
+                [ -z "$TARGET" ] && continue
+                case "$TARGET" in
+                    "Reloj") PREFIX="clock" ;;
+                    "RAM") PREFIX="sys" ;;
+                    "CPU") PREFIX="cpu" ;;
+                    "Red") PREFIX="net" ;;
+                    "Media") PREFIX="media" ;;
+                    "Batería") PREFIX="bat" ;;
+                esac
+                CX=$(get_widget_val "${PREFIX}_pos_x"); CY=$(get_widget_val "${PREFIX}_pos_y"); CS=$(get_widget_val "${PREFIX}_size")
+                read -p "Posición X (0-100, actual: ${CX:-50}): " PX
+                read -p "Posición Y (0-100, actual: ${CY:-50}): " PY
+                set_widget_val "${PREFIX}_pos_x" "${PX:-$CX}"
+                set_widget_val "${PREFIX}_pos_y" "${PY:-$CY}"
+                SIZE=$(echo -e "18\n24\n32\n48\n64\n84\n120" | fzf --prompt="Tamaño fuente (actual: ${CS:-24}): ")
+                [ -n "$SIZE" ] && set_widget_val "${PREFIX}_size" "$SIZE"
+                ;;
+            "✨ Personalizar"*)
+                SUB=$(echo -e "Modo Degradado: [$(get_widget_val viz_gradient_mode || echo true)]\nColor Base\nColor Punta (Degradado)\nOpacidad Base\nOpacidad Punta\nCantidad de Barras\nAltura Máxima\nSeparación (Gap)\nVolver" | fzf --prompt="CAVA Advanced Config: ")
+                case "$SUB" in
+                    "Modo Degradado"*) [ "$(get_widget_val viz_gradient_mode)" = "true" ] && set_widget_val "viz_gradient_mode" "false" || set_widget_val "viz_gradient_mode" "true" ;;
+                    "Color Base") read -p "Color Hex Base (ej: 00FFFF): " CV; set_widget_val "viz_color" "${CV:-00FFFF}" ;;
+                    "Color Punta"*) read -p "Color Hex Punta (ej: FF00FF): " CP; set_widget_val "viz_color_top" "${CP:-FF00FF}" ;;
+                    "Opacidad Base") read -p "Opacidad Base (00 sólido, FF invisible): " AB; set_widget_val "viz_alpha_bottom" "${AB:-00}" ;;
+                    "Opacidad Punta") read -p "Opacidad Punta (00 sólido, FF invisible): " AT; set_widget_val "viz_alpha_top" "${AT:-FF}" ;;
+                    "Cantidad de Barras") read -p "Barras (10-100): " CB; set_widget_val "viz_num_bars" "${CB:-40}"; start_cava ;;
+                    "Altura Máxima") read -p "Altura px: " CH; set_widget_val "viz_max_height" "${CH:-200}" ;;
+                    "Separación (Gap)") read -p "Separación px: " CG; set_widget_val "viz_bar_gap" "${CG:-2}" ;;
+                esac
+                ;;
+            "🎨 Estilo Reloj"*)
+                SUB=$(echo -e "Color Hex\nFormato de Hora\nVolver" | fzf --prompt="Reloj: ")
+                case "$SUB" in
+                    "Color Hex")
+                        COLOR=$(echo -e "Blanco (FFFFFF)\nRojo (FF0000)\nVerde (00FF00)\nAzul (0000FF)\nAmarillo (FFFF00)\nPersonalizado" | fzf --prompt="Color: ")
+                        if [ "$COLOR" = "Personalizado" ]; then read -p "Introduce Hex (ej: FF5500): " COLOR; else 
+                            COLOR=$(echo "$COLOR" | sed -n 's/.*(\([0-9A-F]\{6\}\)).*/\1/p')
+                        fi
+                        [ -n "$COLOR" ] && set_widget_val "clock_color" "$COLOR"
+                        ;;
+                    "Formato de Hora")
+                        FMT=$(echo -e "%H:%M:%S\n%I:%M:%S %p\n%d/%m/%Y %H:%M\nCustom" | fzf --prompt="Formato: ")
+                        [ "$FMT" = "Custom" ] && read -p "Formato: " FMT
+                        [ -n "$FMT" ] && set_widget_val "clock_format" "$FMT"
+                        ;;
+                esac
+                ;;
+            "↩️ Volver") return ;;
+        esac
+    done
+}
+
+optimize_video() {
+    clear
+    if ! command -v ffmpeg &> /dev/null; then
+        echo -e "\e[1;31m❌ Error: ffmpeg no está instalado.\e[0m"
+        echo "Por favor, instálalo ejecutando ./install.sh o mediante tu gestor de paquetes."
+        sleep 3
+        return
+    fi
+
+    echo -e "\e[1;33m--- Lucina Video Optimizer ---\e[0m"
+    echo "Esta herramienta reducirá el peso y consumo de CPU de tus videos."
+    echo ""
+
+    # Seleccionar video
+    local VIDEO=$(find "$BASE_DIR" -maxdepth 2 -type f \( -name "*.mp4" -o -name "*.mkv" -o -name "*.webm" -o -name "*.mov" \) | sort | fzf --prompt="Selecciona video para optimizar: ")
+    [ -z "$VIDEO" ] && return
+    
+    # Seleccionar Resolución
+    local RES_OPT=$(echo -e "Mantener original\n1080p (1920x1080)\n720p (1280x720)\n480p (854x480)\n50% Escala\n25% Escala\nPersonalizado" | fzf --prompt="Selecciona Resolución: ")
+    local SCALE_FLAG=""
+    case "$RES_OPT" in
+        "1080p (1920x1080)") SCALE_FLAG="-vf scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2" ;;
+        "720p (1280x720)")  SCALE_FLAG="-vf scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2" ;;
+        "480p (854x480)")   SCALE_FLAG="-vf scale=854:480:force_original_aspect_ratio=decrease,pad=854:480:(ow-iw)/2:(oh-ih)/2" ;;
+        "50% Escala")      SCALE_FLAG="-vf scale='iw/2:ih/2'" ;;
+        "25% Escala")      SCALE_FLAG="-vf scale='iw/4:ih/4'" ;;
+        "Personalizado")
+            echo -n "Introduce Relación (Ancho:Alto, ej 1920:1080): "
+            read RES_CUSTOM
+            W=$(echo $RES_CUSTOM | cut -d: -f1)
+            H=$(echo $RES_CUSTOM | cut -d: -f2)
+            SCALE_FLAG="-vf scale=$W:$H:force_original_aspect_ratio=decrease,pad=$W:$H:(ow-iw)/2:(oh-ih)/2"
+            ;;
+    esac
+
+    # Seleccionar FPS
+    local FPS_OPT=$(echo -e "Mantener original\n60 FPS\n30 FPS (Recomendado)\n24 FPS\n15 FPS (Bajo consumo)" | fzf --prompt="Selecciona FPS: ")
+    local FPS_FLAG=""
+    case "$FPS_OPT" in
+        "60 FPS") FPS_FLAG="-r 60" ;;
+        "30 FPS (Recomendado)") FPS_FLAG="-r 30" ;;
+        "24 FPS") FPS_FLAG="-r 24" ;;
+        "15 FPS (Bajo consumo)") FPS_FLAG="-r 15" ;;
+    esac
+
+    # Seleccionar Calidad (Preset de bit rate)
+    local QUALITY_OPT=$(echo -e "Media (Equilibrado)\nAlta (Menor compresión)\nBaja (Máximo ahorro)\nExtrema (Muy baja calidad/bitrate)" | fzf --prompt="Selecciona Nivel de Compresión: ")
+    local CRF="23"
+    case "$QUALITY_OPT" in
+        "Alta (Menor compresión)") CRF="18" ;;
+        "Media (Equilibrado)") CRF="23" ;;
+        "Baja (Máximo ahorro)") CRF="28" ;;
+        "Extrema (Muy baja calidad/bitrate)") CRF="35" ;;
+    esac
+
+    local OUTPUT="${VIDEO%.*}_optimized.mp4"
+    
+    clear
+    echo -e "\e[1;32m🚀 Procesando video...\e[0m"
+    echo "------------------------------------------------"
+    echo "Entrada: $(basename "$VIDEO")"
+    echo "Salida:  $(basename "$OUTPUT")"
+    echo "Ajustes: $RES_OPT | $FPS_OPT | CRF $CRF"
+    echo "------------------------------------------------"
+    echo "Presiona Ctrl+C para cancelar."
+    echo ""
+
+    # Ejecutar ffmpeg con libx264 y sin audio
+    ffmpeg -i "$VIDEO" $SCALE_FLAG $FPS_FLAG -c:v libx264 -crf "$CRF" -preset medium -an -y "$OUTPUT"
+    
+    if [ $? -eq 0 ]; then
+        local OLD_SIZE=$(du -h "$VIDEO" | cut -f1)
+        local NEW_SIZE=$(du -h "$OUTPUT" | cut -f1)
+        echo ""
+        echo -e "\e[1;32m✅ ¡Optimización completada con éxito!\e[0m"
+        echo "Tamaño original: $OLD_SIZE"
+        echo "Tamaño nuevo:    $NEW_SIZE"
+        echo ""
+        echo "El archivo se guardó como: $OUTPUT"
+    else
+        echo -e "\e[1;31m❌ Error durante la optimización.\e[0m"
+    fi
+    echo "Presiona cualquier tecla para volver."
+    read -n 1
+}
 
 # --- Menú Principal ---
 while true; do
     clear
-    echo -e "\e[1;36mLucina Engine v3.2 | Codec: $CURRENT_CODEC | Monitor: $MONITOR\e[0m"
+    AUTO_START=$(systemctl --user is-enabled lucina.service 2>/dev/null || echo "disabled")
+    echo -e "\e[1;36mLucina Engine v3.2 | Codec: $CURRENT_CODEC | Monitor: $MONITOR | Auto-start: $AUTO_START\e[0m"
     echo -e "\e[0;33mLogs en: $LOG_FILE\e[0m"
-    OPTION=$(echo -e "▶️ Iniciar Wallpaper\n🔄 Restaurar Último\n⚙️  Cambiar Codec (HWDEC)\n🛠️  Optimizar Video\n❌ Salir" | fzf --prompt="Selecciona una acción: ")
+    OPTION=$(echo -e "▶️ Iniciar Wallpaper\n🔄 Restaurar Último\n⚙️  Cambiar Codec (HWDEC)\n🛠️  Optimizar Video\n🧩 Withgets (Widgets)\n🔄 Alternar Inicio Automático\n❌ Salir" | fzf --prompt="Selecciona una acción: ")
 
     case "$OPTION" in
         "▶️ Iniciar Wallpaper")
             SELECTED=$(find "$BASE_DIR" -maxdepth 2 -type f \( -name "*.mp4" -o -name "*.mkv" -o -name "*.png" -o -name "*.jpg" -o -name "*.jpeg" -o -name "*.webp" -o -name "*.gif" \) | sort | fzf --prompt="🌌 Fondo: ")
             [ -z "$SELECTED" ] && continue
-            echo "$SELECTED" > "$STATE_FILE"
             
             MODE=$(echo "performance mid low very_low" | tr ' ' '\n' | fzf --prompt="⚡ Perfil: ")
             [ -z "$MODE" ] && continue
             
             start_engine "$SELECTED" "$MODE"
             break
+            ;;
+        "🧩 Withgets (Widgets)")
+            widgets_menu
+            ;;
+        "🔄 Alternar Inicio Automático")
+            if [ "$AUTO_START" = "enabled" ]; then
+                systemctl --user disable lucina.service
+                echo "❌ Inicio automático (persistencia) desactivado"
+            else
+                systemctl --user enable lucina.service
+                echo "✅ Inicio automático (persistencia) activado"
+            fi
+            sleep 1
             ;;
         "🔄 Restaurar Último")
             if [ -f "$STATE_FILE" ]; then
@@ -174,7 +460,7 @@ while true; do
             change_codec
             ;;
         "🛠️  Optimizar Video")
-            # Tu función transform_wallpaper original aquí...
+            optimize_video
             ;;
         "❌ Salir") exit 0 ;;
         *) exit 0 ;;

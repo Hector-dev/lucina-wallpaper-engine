@@ -48,12 +48,19 @@ function read_cava_data()
     return nil
 end
 
-function draw()
+local last_ass = nil
+
+local function draw()
     local w, h = mp.get_osd_size()
     if not w or w == 0 then w = 1280; h = 720 end
     
-    local newData = read_cava_data()
-    if newData and #newData > 0 then cava_bars = newData end
+    -- Sin visualizador activo no hay motivo para leer el archivo de CAVA 25 veces/s
+    if config.visualizer_enabled == "true" then
+        local newData = read_cava_data()
+        if newData and #newData > 0 then cava_bars = newData end
+    else
+        cava_bars = {}
+    end
     
     local ass = ""
     
@@ -99,7 +106,14 @@ function draw()
             xc, yc, tonumber(config.clock_size or 48), hex_to_ass(config.clock_color), os.date(config.clock_format))
     end
     
-    mp.set_osd_ass(w, h, ass)
+    -- Sólo redibujamos si el ASS cambió: el reloj cambia 1 vez/s, no 25.
+    if ass ~= last_ass then
+        mp.set_osd_ass(w, h, ass)
+        last_ass = ass
+    end
+
+    -- Re-armado adaptativo: 25 fps con visualizador, 4 fps con sólo widgets estáticos.
+    mp.add_timeout(config.visualizer_enabled == "true" and 0.04 or 0.25, draw)
 end
 
-mp.add_periodic_timer(0.04, draw)
+mp.add_timeout(0.1, draw)

@@ -1,6 +1,6 @@
 #!/bin/bash
-# Lucina Engine v3.2 - Codec Adaptive Edition
-# Optimizaciones: Selección manual de HWDEC | Persistencia de Configuración
+# Lucina Engine v3.3 - Supervisor Edition
+# Supervisor con reintento de HWDEC | Backend de imagen | CLI (set/status/bench)
 
 # --- Configuración de Rutas ---
 BASE_DIR="${LUCINA_WALLPAPER_DIR:-$HOME/wallpaper}"
@@ -52,13 +52,72 @@ if [ ! -f "$CODEC_FILE" ]; then
     else echo "auto" > "$CODEC_FILE"; fi
 fi
 CURRENT_CODEC=$(cat "$CODEC_FILE")
-MONITOR=$(mpvpaper -d | grep "Output:" | awk '{print $3}' | head -n 1) # Inicializar monitor
+
+# Detectar el monitor cuesta ~80 ms y un pico de RAM (lanza mpvpaper). Se hace una vez.
+MONITOR_CACHE=""
+detect_monitor() {
+    if [ -z "$MONITOR_CACHE" ]; then
+        MONITOR_CACHE=$(mpvpaper -d 2>/dev/null | grep "Output:" | awk '{print $3}' | head -n 1)
+    fi
+    printf '%s' "$MONITOR_CACHE"
+}
+MONITOR=$(detect_monitor) # Inicializar monitor
+
+# PID del motor actual: permite matar sólo lo nuestro y no cualquier mpvpaper del usuario.
+ENGINE_PID=""
+
+# Patrón anclado a "mpvpaper": evita que pgrep -f coincida con un shell o un editor
+# que mencione la ruta del socket.
+ENGINE_MATCH='^mpvpaper .*input-ipc-server=/tmp/lucina_mpv\.sock'
+
+# Sin GPU NVIDIA, el loader EGL de glvnd intenta cargar el stack NVIDIA (libcuda,
+# libnvidia-egl*) y se lleva ~90 MB de RSS residente para nada. Forzar Mesa evita
+# ese probe. En equipos con NVIDIA real no se toca.
+if [ -z "${__EGL_VENDOR_LIBRARY_FILENAMES:-}" ] \
+   && [ -f /usr/share/glvnd/egl_vendor.d/50_mesa.json ] \
+   && ! lspci 2>/dev/null | grep -qi "nvidia"; then
+    export __EGL_VENDOR_LIBRARY_FILENAMES=/usr/share/glvnd/egl_vendor.d/50_mesa.json
+fi
+
+# Renderer de imagen estática: 5-8 MB y 0 % de CPU, sin decodificar nada.
+# Si no hay ninguno instalado, la imagen se sigue pintando con mpvpaper.
+detect_image_renderer() {
+    local tool
+    for tool in swaybg wbg; do
+        if command -v "$tool" >/dev/null 2>&1; then printf '%s' "$tool"; return; fi
+    done
+    printf ''
+}
+IMAGE_RENDERER="$(detect_image_renderer)"
+
+# Tier por hardware: decide el perfil cuando el usuario no pasa uno.
+detect_tier() {
+    if [ -n "${LUCINA_TIER:-}" ]; then printf '%s' "$LUCINA_TIER"; return; fi
+    local mem_kb cores
+    mem_kb=$(awk '/^MemTotal:/{print $2}' /proc/meminfo 2>/dev/null || echo 0)
+    cores=$(nproc 2>/dev/null || echo 1)
+    if [ "${mem_kb:-0}" -le 3000000 ] || [ "${cores:-1}" -le 2 ]; then printf 'potato'
+    elif [ "${mem_kb:-0}" -le 6000000 ]; then printf 'low'
+    elif [ "${mem_kb:-0}" -le 12000000 ]; then printf 'balanced'
+    else printf 'max'; fi
+}
+
+tier_profile() {
+    case "$(detect_tier)" in
+        potato) printf 'very_low';;
+        low) printf 'low';;
+        *) printf 'mid';;
+    esac
+}
 
 # --- Perfiles de Rendimiento ---
 declare -A PROFILES
-PROFILES[performance]="--loop-file=inf"
-PROFILES[mid]="--profile=fast --loop-file=inf"
-PROFILES[low]="--profile=fast --vd-lavc-fast --framedrop=vo --loop-file=inf"
+# Ningún perfil repite --loop-file: ya vive en LOOP_FLAGS.
+# --profile=fast ajusta scalers/dither; medido en este equipo ahorra ~1 punto de CPU
+# incluso con escalado 1:1 (4.6 % vs 5.6 %), así que se mantiene en mid/low/very_low.
+PROFILES[performance]=""
+PROFILES[mid]="--profile=fast"
+PROFILES[low]="--profile=fast --vd-lavc-fast --framedrop=vo"
 PROFILES[very_low]="--gpu-context=wayland --hwdec-codecs=all --vd-lavc-fast --framedrop=vo --cache=no --demuxer-max-bytes=1MiB --vd-lavc-threads=1 --sws-scaler=fast --dither=no --scale=nearest --cscale=nearest --gpu-api=opengl --video-sync=display-desync --alpha=no --fast --hwdec-extra-frames=0 --gpu-dumb-mode=yes"
 
 # --- Funciones de Soporte ---
@@ -118,12 +177,6 @@ bridge()' >> "$LOG_FILE" 2>&1 &
 }
 set_widget_val() { sed -i "/^$1=/d" "$WIDGETS_CONF"; echo "$1=$2" >> "$WIDGETS_CONF"; }
 get_widget_val() { grep "^$1=" "$WIDGETS_CONF" | cut -d= -f2; }
-check_instance() {
-    if pgrep -x "mpvpaper" > /dev/null && [ "$USE_FORK" = "true" ]; then
-        echo "⚠️  Lucina ya está corriendo. Usa el menú para gestionarla."
-    fi
-}
-
 get_resolution() {
     local res=""
     if command -v hyprctl &>/dev/null; then
@@ -137,12 +190,24 @@ get_resolution() {
 }
 
 check_instance() {
+    local pid
+    pid=$(pgrep -f "$ENGINE_MATCH" 2>/dev/null | head -n 1)
+    if [ -n "$pid" ]; then
+        echo "⚠️  Lucina ya está corriendo (PID $pid). Usa el menú para gestionarla."
+    fi
+}
+
+# Bloquea un segundo servicio, pero nunca el menú interactivo (que debe poder gestionar).
+acquire_service_lock() {
     if [ -f "$LOCK_FILE" ]; then
-        pid=$(cat "$LOCK_FILE")
-        if ps -p "$pid" > /dev/null 2>&1; then
-            log "WARN" "Instancia ya activa (PID: $pid). Saliendo."
+        local pid
+        pid=$(cat "$LOCK_FILE" 2>/dev/null)
+        # /tmp se reutiliza: el PID sólo bloquea si sigue vivo y es realmente lucina.
+        if [ -n "$pid" ] && [ -d "/proc/$pid" ] && tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null | grep -q "lucina"; then
+            log "WARN" "Servicio ya activo (PID: $pid). Saliendo."
             exit 1
         fi
+        log "WARN" "Lock huérfano (PID ${pid:-vacío}), se reemplaza."
     fi
     echo $$ > "$LOCK_FILE"
 }
@@ -162,36 +227,118 @@ change_codec() {
     fi
 }
 
+# Detiene únicamente el motor propio (o un huérfano reconocible por su socket IPC).
+stop_engine() {
+    local pid="${ENGINE_PID:-}"
+    if [ -z "$pid" ]; then
+        pid=$(pgrep -f "$ENGINE_MATCH" 2>/dev/null | head -n 1)
+    fi
+    if [ -z "$pid" ] && command -v pgrep >/dev/null; then
+        pid=$(pgrep -x swaybg 2>/dev/null | head -n 1)
+    fi
+    [ -z "$pid" ] && return 0
+    kill -TERM "$pid" 2>/dev/null
+    local i
+    for i in $(seq 1 20); do
+        kill -0 "$pid" 2>/dev/null || return 0
+        sleep 0.05
+    done
+    log "WARN" "El motor no terminó con SIGTERM (PID $pid); enviando SIGKILL."
+    kill -KILL "$pid" 2>/dev/null
+    ENGINE_PID=""
+    return 0
+}
+
+# Bucle supervisor del modo systemd: reinicia el motor, reintenta hardware y sólo
+# degrada a software tras fallos rápidos repetidos. Vuelve a probar hardware
+# después de una corrida estable, así un fallo puntual no cuesta el resto de la sesión.
+supervise_engine() {
+    local FILE="$1" PROFILE="$2" HW_FLAG="$3" STATIC="$4"
+    local hw="$HW_FLAG" fails=0 backoff=1 started elapsed rc
+
+    while true; do
+        started=$SECONDS
+        mpvpaper -p -o "$hw $LOOP_FLAGS ${PROFILES[$PROFILE]}" "$MONITOR" "$FILE" >> "$LOG_FILE" 2>&1 &
+        ENGINE_PID=$!
+        wait "$ENGINE_PID"; rc=$?
+        elapsed=$(( SECONDS - started ))
+
+        if [ "$elapsed" -ge 10 ]; then
+            # Corrida sana: un fallo aislado no justifica degradar.
+            fails=0; backoff=1
+            if [ "$hw" != "$HW_FLAG" ]; then
+                hw="$HW_FLAG"
+                log "INFO" "Corrida estable de ${elapsed}s; vuelvo a intentar ${HW_FLAG#--hwdec=}."
+            else
+                log "WARN" "El motor terminó tras ${elapsed}s (rc=$rc); reiniciando."
+            fi
+        else
+            fails=$(( fails + 1 ))
+            log "ERROR" "El motor falló rápido (rc=$rc, ${elapsed}s, intento $fails con ${hw#--hwdec=})."
+            if [ "$STATIC" -eq 0 ] && [ "$fails" -ge 2 ] && [ "$hw" != "--hwdec=no" ]; then
+                hw="--hwdec=no"; fails=0
+                log "WARN" "Degradación temporal a software; se reintentará hardware tras una corrida estable."
+            fi
+        fi
+
+        sleep "$backoff"
+        backoff=$(( backoff * 2 ))
+        [ "$backoff" -gt 30 ] && backoff=30
+    done
+}
+
+# Lanza el renderer de imagen estática. Devuelve 1 si no hay ninguno disponible.
+start_image_engine() {
+    local FILE="$1"
+    case "$IMAGE_RENDERER" in
+        swaybg) swaybg -i "$FILE" -m fill >>"$LOG_FILE" 2>&1 & ENGINE_PID=$! ;;
+        wbg)    wbg "$FILE" >>"$LOG_FILE" 2>&1 & ENGINE_PID=$! ;;
+        *)      return 1 ;;
+    esac
+    return 0
+}
+
+# Modo systemd con imagen: sin decodificador que reintentar, sólo reinicio con backoff.
+supervise_image() {
+    local FILE="$1" backoff=1 rc
+    while true; do
+        start_image_engine "$FILE" || return 1
+        wait "$ENGINE_PID"; rc=$?
+        log "WARN" "Renderer de imagen terminó (rc=$rc); reintentando en ${backoff}s."
+        sleep "$backoff"
+        backoff=$(( backoff * 2 ))
+        [ "$backoff" -gt 30 ] && backoff=30
+    done
+}
+
 start_engine() {
-    pkill -SIGTERM mpvpaper 2>/dev/null
-    sleep 0.3
-    
-    MONITOR=$(mpvpaper -d | grep "Output:" | awk '{print $3}' | head -n 1)
+    local FILE="$1" PROFILE="${2:-}" HW_FLAG STATIC=0
+    [ -z "$PROFILE" ] && PROFILE="$(tier_profile)"
+
+    stop_engine
+    MONITOR=$(detect_monitor)
     RESOLUTION=$(get_resolution)
-    
-    # Inyección del codec seleccionado + perfil
+
     HW_FLAG="--hwdec=$CURRENT_CODEC"
-    
+
     # Guardar estado para persistencia
-    echo "$1" > "$STATE_FILE"
-    echo "$2" > "$PROFILE_FILE"
-    
-    # Limpieza previa agresiva
-    pkill -9 -f mpvpaper 2>/dev/null
+    echo "$FILE" > "$STATE_FILE"
+    echo "$PROFILE" > "$PROFILE_FILE"
+
     stop_cava # Detener visualizador previo
-    sleep 0.2
 
     # Si es una imagen o GIF, desactivar HWDEC (evita fallos en NVIDIA)
-    case "${1##*.}" in
+    case "${FILE##*.}" in
         png|jpg|jpeg|webp|gif)
             HW_FLAG="--hwdec=no"
+            STATIC=1
             log "INFO" "Formato estático detectado, usando software."
             ;;
     esac
 
     # Flags universales para minimizar consumo de RAM y CPU
     LOOP_FLAGS="--loop-file=inf --loop-playlist=inf --no-audio --cache=no --demuxer-max-bytes=16MiB --demuxer-max-back-bytes=16MiB --msg-level=all=no --terminal=no --input-ipc-server=/tmp/lucina_mpv.sock"
-    
+
     # Inyectar Script de Widgets si existe
     if [ -f "$WIDGET_DIR/lucina_widgets.lua" ]; then
         LOOP_FLAGS="$LOOP_FLAGS --script=$WIDGET_DIR/lucina_widgets.lua"
@@ -200,23 +347,99 @@ start_engine() {
     # Iniciar motor CAVA real si está habilitado
     start_cava
 
-    log "INFO" "Iniciando: $1 | Modo: $2 | Codec: $CURRENT_CODEC | Res: $RESOLUTION | Monitor: $MONITOR | Fork: $USE_FORK"
-    log "DEBUG" "Banderas mpv: $HW_FLAG $LOOP_FLAGS ${PROFILES[$2]}"
-    echo "🚀 Renderizando en $MONITOR ($RESOLUTION) con $CURRENT_CODEC en modo $2..."
+    log "INFO" "Iniciando: $FILE | Modo: $PROFILE | Codec: $CURRENT_CODEC | Res: $RESOLUTION | Monitor: $MONITOR | Fork: $USE_FORK"
+    log "DEBUG" "Banderas mpv: $HW_FLAG $LOOP_FLAGS ${PROFILES[$PROFILE]}"
+    echo "🚀 Renderizando en $MONITOR ($RESOLUTION) con ${HW_FLAG#--hwdec=} en modo $PROFILE..."
 
-    if [ "$USE_FORK" = "false" ]; then
-        # Modo Foreground (Ideal para systemd)
-        if ! mpvpaper -p -o "$HW_FLAG $LOOP_FLAGS ${PROFILES[$2]}" "$MONITOR" "$1" >> "$LOG_FILE" 2>&1; then
-            log "ERROR" "Fallo inicial. Reintentando con Fallback de Software..."
-            exec mpvpaper -p -o "--hwdec=no $LOOP_FLAGS ${PROFILES[low]}" "$MONITOR" "$1" >> "$LOG_FILE" 2>&1
+    # Imagen estática: si hay swaybg/wbg, no tiene sentido decodificar con mpv.
+    if [ "$STATIC" -eq 1 ] && [ -n "$IMAGE_RENDERER" ]; then
+        log "INFO" "Renderer de imagen: $IMAGE_RENDERER"
+        if [ "$USE_FORK" = "true" ]; then
+            start_image_engine "$FILE" || log "ERROR" "No se pudo lanzar $IMAGE_RENDERER."
+        else
+            supervise_image "$FILE"
+        fi
+        return
+    fi
+
+    if [ "$USE_FORK" = "true" ]; then
+        # Modo background (terminal interactiva): mpvpaper -f devuelve el control.
+        mpvpaper -f -p -o "$HW_FLAG $LOOP_FLAGS ${PROFILES[$PROFILE]}" "$MONITOR" "$FILE" >> "$LOG_FILE" 2>&1
+        if [ $? -ne 0 ] && [ "$STATIC" -eq 0 ]; then
+            log "ERROR" "Arranque con $CURRENT_CODEC falló; reintento puntual con software."
+            mpvpaper -f -p -o "--hwdec=no $LOOP_FLAGS ${PROFILES[low]}" "$MONITOR" "$FILE" >> "$LOG_FILE" 2>&1
         fi
     else
-        # Modo Background (Ideal para terminal interactiva)
-        if ! mpvpaper -f -p -o "$HW_FLAG $LOOP_FLAGS ${PROFILES[$2]}" "$MONITOR" "$1" >> "$LOG_FILE" 2>&1; then
-            log "ERROR" "Fallo inicial. Reintentando con Fallback de Software mediante EXEC..."
-            exec mpvpaper -f -p -o "--hwdec=no $LOOP_FLAGS ${PROFILES[low]}" "$MONITOR" "$1" >> "$LOG_FILE" 2>&1
-        fi
+        # Modo systemd: el supervisor es este proceso, no mpvpaper.
+        supervise_engine "$FILE" "$PROFILE" "$HW_FLAG" "$STATIC"
     fi
+}
+
+# --- Benchmark ---
+# Mide el motor en vivo: RSS, hilos, CPU real y estado del decodificador por IPC.
+bench() {
+    local duration="${1:-8}" pid
+    pid=$(pgrep -f "$ENGINE_MATCH" 2>/dev/null | head -n 1)
+    [ -z "$pid" ] && pid=$(pgrep -x mpvpaper 2>/dev/null | head -n 1)
+    [ -z "$pid" ] && pid=$(pgrep -x swaybg 2>/dev/null | head -n 1)
+    if [ -z "$pid" ]; then
+        echo "❌ No hay motor activo. Arranca un wallpaper primero."
+        return 1
+    fi
+    echo "⏱  Midiendo ${duration}s sobre PID $pid (socket IPC: /tmp/lucina_mpv.sock)"
+    python3 - "$pid" "$duration" <<'PY'
+import sys, time, json, socket, os
+pid = int(sys.argv[1]); dur = float(sys.argv[2])
+hz = os.sysconf("SC_CLK_TCK")
+def ticks():
+    p = open(f"/proc/{pid}/stat").read().rsplit(")", 1)[1].split()
+    return int(p[11]) + int(p[12])
+def status():
+    d = {}
+    for line in open(f"/proc/{pid}/status"):
+        k, v = line.split(":", 1)
+        if k in ("VmRSS", "VmHWM", "Threads", "RssAnon", "RssFile", "VmSwap"): d[k] = v.strip()
+    return d
+def ipc(props):
+    out, buf = {}, b""
+    try:
+        s = socket.socket(socket.AF_UNIX); s.settimeout(2); s.connect("/tmp/lucina_mpv.sock")
+    except Exception:
+        return out
+    for i, p in enumerate(props):
+        s.send((json.dumps({"command": ["get_property", p], "request_id": i}) + "\n").encode())
+    while len(out) < len(props):
+        chunk = s.recv(65536)
+        if not chunk: break
+        buf += chunk
+        while b"\n" in buf:
+            line, buf = buf.split(b"\n", 1)
+            try: msg = json.loads(line)
+            except Exception: continue
+            out[props[msg["request_id"]]] = msg.get("data", msg.get("error"))
+    return out
+props = ["hwdec-current", "estimated-vf-fps", "frame-drop-count", "decoder-frame-drop-count", "video-params"]
+c1 = ticks(); t1 = time.time(); time.sleep(dur); c2 = ticks(); dt = time.time() - t1
+a = ipc(props); st = status(); vp = a.get("video-params") or {}
+rss = int(st.get("VmRSS", "0 kB").split()[0]) / 1024
+peak = int(st.get("VmHWM", "0 kB").split()[0]) / 1024
+anon = int(st.get("RssAnon", "0 kB").split()[0]) / 1024
+filer = int(st.get("RssFile", "0 kB").split()[0]) / 1024
+swap = int(st.get("VmSwap", "0 kB").split()[0]) / 1024
+cpu = (c2 - c1) * 100.0 / (hz * dt)
+print()
+print(f"  RSS         {rss:8.1f} MB   (pico {peak:.1f} MB)")
+print(f"  Anon/File   {anon:8.1f} MB   / {filer:.1f} MB   (swap {swap:.1f} MB)")
+print(f"  Hilos       {st.get('Threads', '?'):>8}")
+print(f"  CPU         {cpu:8.2f} %   (de un núcleo)")
+if a:
+    print(f"  HWDEC       {str(a.get('hwdec-current', '?')):>8}")
+    print(f"  FPS efect.  {a.get('estimated-vf-fps', '?'):>8}")
+    print(f"  Drops       VO {a.get('frame-drop-count', '?')} · decoder {a.get('decoder-frame-drop-count', '?')}")
+    print(f"  Video       {vp.get('w', '?')}x{vp.get('h', '?')} {vp.get('pixelformat', '')}")
+else:
+    print("  Renderer    imagen estática (sin decodificador ni socket IPC)")
+PY
 }
 
 # --- Manejo de Argumentos ---
@@ -224,8 +447,62 @@ if [[ "$*" == *"--no-fork"* ]]; then
     USE_FORK="false"
 fi
 
+if [[ "$1" == "bench" || "$1" == "--bench" ]]; then
+    bench "${2:-8}"
+    exit 0
+fi
+
+if [[ "$1" == "set" ]]; then
+    SET_FILE="${2:-}"
+    SET_PROFILE="${3:-}"
+    [ -z "$SET_PROFILE" ] && SET_PROFILE="$(tier_profile)"
+    if [ -z "$SET_FILE" ]; then
+        echo "uso: lucina set <archivo> [performance|mid|low|very_low]"
+        exit 1
+    fi
+    [ -f "$SET_FILE" ] || SET_FILE="$BASE_DIR/$SET_FILE"
+    if [ ! -f "$SET_FILE" ]; then
+        echo "❌ No existe: $SET_FILE"
+        exit 1
+    fi
+    if [ -z "${PROFILES[$SET_PROFILE]+x}" ]; then
+        echo "❌ Perfil desconocido: $SET_PROFILE (usa performance|mid|low|very_low)"
+        exit 1
+    fi
+    check_instance
+    start_engine "$SET_FILE" "$SET_PROFILE"
+    exit 0
+fi
+
+if [[ "$1" == "status" ]]; then
+    echo "Lucina Engine — estado"
+    echo "  perfil   : $(cat "$PROFILE_FILE" 2>/dev/null || echo '-')"
+    echo "  codec    : $CURRENT_CODEC"
+    echo "  monitor  : $(detect_monitor)"
+    echo "  archivo  : $(cat "$STATE_FILE" 2>/dev/null || echo '-')"
+    echo "  tier     : $(detect_tier) (perfil por defecto: $(tier_profile))"
+    if [ -n "$IMAGE_RENDERER" ]; then
+        echo "  renderer : mpvpaper (vídeo) · $IMAGE_RENDERER (imagen)"
+    else
+        echo "  renderer : mpvpaper (sin renderer de imagen)"
+    fi
+    pid=$(pgrep -f "$ENGINE_MATCH" 2>/dev/null | head -n 1)
+    [ -z "$pid" ] && pid=$(pgrep -x swaybg 2>/dev/null | head -n 1)
+    if [ -n "$pid" ]; then
+        echo "  motor    : activo (PID $pid)"
+    else
+        echo "  motor    : detenido"
+    fi
+    svc=$(systemctl --user is-active lucina.service 2>/dev/null)
+    echo "  servicio : ${svc:-desconocido}"
+    echo "  log      : $LOG_FILE"
+    exit 0
+fi
+
 if [[ "$1" == "--restore" ]]; then
     USE_FORK="false" # El servicio de systemd requiere primer plano
+    acquire_service_lock
+    trap 'stop_engine; stop_cava; rm -f "$LOCK_FILE"; exit 0' TERM INT
     if [ -f "$STATE_FILE" ]; then
         LAST_WALL=$(cat "$STATE_FILE")
         LAST_PROF=$(cat "$PROFILE_FILE" 2>/dev/null || echo "performance")

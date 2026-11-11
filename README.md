@@ -1,4 +1,4 @@
-# Lucina Engine v3.2 🌌
+# Lucina Engine v3.3 🌌
 
 **Lucina Engine** is a high-performance, universal wallpaper engine for Wayland. It transforms your desktop with dynamic videos and static images, featuring intelligent hardware acceleration and seamless persistence.
 
